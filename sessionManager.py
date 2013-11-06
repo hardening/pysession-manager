@@ -30,7 +30,7 @@ class ProtobufHandler(SocketServer.BaseRequestHandler):
         while waitTime < 10:
             if not os.path.exists(pipeName):
                 time.sleep(0.1)
-            waitTime -= 0.1
+            waitTime += 0.1
         
         if not os.path.exists(pipeName):
             return None
