@@ -8,20 +8,26 @@ import sys
 
 pipeDir = os.path.join("/tmp", ".pipe")
 
+KNOWN_USERS = {
+    'local': {
+        'david': 'david'
+    },    
+}
+
 class ProtobufHandler(SocketServer.BaseRequestHandler):
     '''
     '''
     globalId = 0
         
     def GetUserSession(self, getUserReq):
-        print "getUserSession"
+        print "getUserSession(%s@%s)" % (getUserReq.username, getUserReq.domainname)
         ret = ICP_pb2.GetUserSessionResponse()
         ret.SessionID = self.globalId
-        self.globalId += 1
+        #self.globalId += 1
         ret.ServiceEndpoint = "\\\\.\\pipe\\FreeRDS_%d_greeter" % ret.SessionID
         
-        pipeName = '%s/FreeRDS_%d_greeter' % (pipeDir, ret.SessionID)
-        if os.fork() == 0:
+        pipeName = '%s/FreeRDS_%d_greeter' % (pipeDir, ret.SessionID)        
+        if False and os.fork() == 0:
             prog = "/home/david/dev/git/qfreerdp_platform/chart.sh"       
             args = [prog, pipeName, '-platform', 'freerds:width=%d:height=%d' % (1024, 768)]
             os.execl(prog, *args)            
@@ -42,13 +48,38 @@ class ProtobufHandler(SocketServer.BaseRequestHandler):
         ret.ChannelAllowed = True
         return ret
     
+    def LogonUser(self, msg):
+        print "LogonUser(session=%s user=%s)" % (msg.SessionId, msg.Username)
+        domainUsers = KNOWN_USERS.get(msg.Domain, None)
+        if domainUsers:
+            localPassword = domainUsers.get(msg.Username, None)
+            if localPassword == msg.Password:
+                print "Implement login OK"
+            
+        ret = ICP_pb2.LogonUserResponse()
+        ret.SessionId = msg.SessionId
+        ret.AuthStatus = 1;
+        ret.ServiceEndpoint = "\\\\.\\pipe\\FreeRDS_%d_greeter" % ret.SessionId
+        return ret
+      
+    def DisconnectUserSession(self, msg):
+        ret = ICP_pb2.DisconnectUserSessionResponse()
+        ret.disconnected = True
+        return ret
+    
     def treat_request(self, rpcbase):
         callbacks = {
                ICP_pb2.IsChannelAllowed: (self.IsChannelAllowed, ICP_pb2.IsChannelAllowedRequest), 
-               ICP_pb2.GetUserSession: (self.GetUserSession, ICP_pb2.GetUserSessionRequest)
+               ICP_pb2.GetUserSession: (self.GetUserSession, ICP_pb2.GetUserSessionRequest),
+               ICP_pb2.LogonUser: (self.LogonUser, ICP_pb2.LogonUserRequest),
+               ICP_pb2.DisconnectUserSession: (self.DisconnectUserSession, ICP_pb2.DisconnectUserSessionRequest),
         }
         
-        (cb, ctor) = callbacks.get(rpcbase.msgType, None)
+        cbInfos = callbacks.get(rpcbase.msgType, None)         
+        if cbInfos is None:
+            print "unknown callback %s" % rpcbase.msgType
+            return None
+        (cb, ctor) = cbInfos 
         obj = ctor()
         obj.ParseFromString(rpcbase.payload)
         return cb(obj)
@@ -60,13 +91,11 @@ class ProtobufHandler(SocketServer.BaseRequestHandler):
         
     
     def handle(self):
-        print "client starting"
         while True:
             lenBytes = self.request.recv(4)
             if not len(lenBytes):
                 break            
             msgLen = struct.unpack("!i", lenBytes)[0]
-            print "msgLen=%s" % msgLen
             
             msg = self.request.recv(msgLen)
             baseRpc = pbRPC_pb2.RPCBase()
@@ -82,11 +111,7 @@ class ProtobufHandler(SocketServer.BaseRequestHandler):
                     response = baseRpc.SerializeToString()
                     self.request.send( struct.pack("!i", len(response)) )                  
                     self.request.send( response )
-                        
-        print "client finished"
-        
-        
-
+                                
 
 if __name__ == "__main__": 
     fullPath = os.path.join(pipeDir, "FreeRDS_SessionManager")
