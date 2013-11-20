@@ -49,20 +49,23 @@ class ProtobufHandler(SocketServer.BaseRequestHandler):
         return ret
     
     def LogonUser(self, msg):
-        print "LogonUser(session=%s user=%s)" % (msg.SessionId, msg.Username)
+        print "LogonUser(session=%s user=%s domain=%s)" % (msg.SessionId, msg.Username, msg.Domain)
+        ret = ICP_pb2.LogonUserResponse()
+        ret.AuthStatus = 1;
+
         domainUsers = KNOWN_USERS.get(msg.Domain, None)
         if domainUsers:
             localPassword = domainUsers.get(msg.Username, None)
             if localPassword == msg.Password:
                 print "Implement login OK"
-            
-        ret = ICP_pb2.LogonUserResponse()
+                ret.AuthStatus = 0;
+
         ret.SessionId = msg.SessionId
-        ret.AuthStatus = 1;
         ret.ServiceEndpoint = "\\\\.\\pipe\\FreeRDS_%d_greeter" % ret.SessionId
         return ret
       
     def DisconnectUserSession(self, msg):
+        print "DisconnectUserSession(%s)" % msg.SessionID
         ret = ICP_pb2.DisconnectUserSessionResponse()
         ret.disconnected = True
         return ret
