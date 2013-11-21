@@ -1,0 +1,30 @@
+{
+	"global": {
+		"listeningPipe": "FreeRDS_SessionManager",
+		"pipesDirectory": "/tmp/.pipe/",
+		"ld_library_path": [
+			"/home/david/dev/install-freerds/lib",
+			"/home/david/dev/install-freerds/lib/x86_64-linux-gnu/"
+		]
+	},
+	
+	"qt": {
+		"pluginsPath": "/home/david/dev/git/qfreerds_platform/plugins",
+        "variableName": "FREERDS_PIPE_PATH",
+        "initialGeometry": "800x600"	
+	},
+	
+   "weston": {
+        "initialGeometry": "1024x768"
+    },
+    
+    "greeter": {
+    	"template": "qt",
+    	"path": "/home/david/dev/git/qfreerds_platform/examples/nice_greeter/nice_greeter"
+    },
+    
+    "desktop": {
+    	"template": "weston",
+    	"path": "/home/david/dev/git/weston/output/src/weston"
+    }
+}

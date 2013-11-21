@@ -5,6 +5,8 @@ import os, os.path
 import time
 import struct
 import sys
+import json
+import content_provider
 
 pipeDir = os.path.join("/tmp", ".pipe")
 
@@ -14,10 +16,96 @@ KNOWN_USERS = {
     },    
 }
 
-class ProtobufHandler(SocketServer.BaseRequestHandler):
+ICP_METHODS_TO_BIND = ("IsChannelAllowed", "Ping", "GetUserSession",
+    "DisconnectUserSession", "LogOffUserSession",
+    "FdsApiVirtualChannelOpen", "LogonUser"
+)
+
+def buildIcpMethodDescriptor():
+    ret = {}
+    for messageIdName in ICP_METHODS_TO_BIND:
+        messageId = getattr(ICP_pb2, messageIdName, None)
+        if messageId is None:
+            print "unable to retrieve %s" % messageIdName
+            continue
+        
+        reqCtor = getattr(ICP_pb2, messageIdName + "Request", None)
+        if reqCtor is None:
+            print "unable to retrieve %sRequest" % messageIdName
+            continue
+        ret[messageId] = (messageIdName, reqCtor)
+    return ret
+        
+
+
+
+class PbRpcHandler(SocketServer.BaseRequestHandler):
     '''
+        @summary: a base class to handle the protobuf RPC protocol that is spoken
+                  between FreeRDS and the sessionManager
+    '''
+
+    def answer404(self, pbRpc):
+        pbRpc.status = pbRPC_pb2.RPCBase.NOTFOUND
+        pbRpc.isResponse = True
+        pbRpc.payload = None
+        response = pbRpc.SerializeToString()
+        self.request.send( struct.pack("!i", len(response)) )                  
+        self.request.send( response )
+        return 404            
+    
+    def treat_request(self, pbRpc):
+        cbInfos = self.methodMapper.get(pbRpc.msgType, None)         
+        if cbInfos is None:
+            print "unknown method with id=%s" % pbRpc.msgType
+            return self.answer404(pbRpc)                        
+        
+        (methodName, ctor) = cbInfos
+        toCall = getattr(self, methodName, None)
+        if not callable(toCall):
+            print "unknown method with id=%s" % pbRpc.msgType
+            return self.answer404(pbRpc)                        
+                     
+        obj = ctor()
+        obj.ParseFromString(pbRpc.payload)
+
+        ret = toCall(obj)
+        if ret:
+            pbRpc.status = pbRPC_pb2.RPCBase.SUCCESS
+            pbRpc.isResponse = True
+            pbRpc.payload = ret.SerializeToString()
+            response = pbRpc.SerializeToString()
+            self.request.send( struct.pack("!i", len(response)) )                  
+            self.request.send( response )
+        return 200
+        
+    def handle(self):
+        while True:
+            lenBytes = self.request.recv(4)
+            if not len(lenBytes):
+                break            
+            msgLen = struct.unpack("!i", lenBytes)[0]
+            
+            msg = self.request.recv(msgLen)
+            baseRpc = pbRPC_pb2.RPCBase()
+            baseRpc.ParseFromString(msg)
+            
+            if baseRpc.isResponse:
+                self.treat_response(baseRpc)
+            else:
+                self.treat_request(baseRpc)
+                
+
+class IcpHandler(PbRpcHandler):
+    '''
+        @summary: the ICP part of the SessionManager
     '''
     globalId = 0
+        
+    def __init__(self, *params, **kwparams):
+        self.methodMapper = buildIcpMethodDescriptor()
+        PbRpcHandler.__init__(self, *params, **kwparams)
+                
         
     def GetUserSession(self, getUserReq):
         print "getUserSession(%s@%s)" % (getUserReq.username, getUserReq.domainname)
@@ -57,11 +145,17 @@ class ProtobufHandler(SocketServer.BaseRequestHandler):
         if domainUsers:
             localPassword = domainUsers.get(msg.Username, None)
             if localPassword == msg.Password:
-                print "Implement login OK"
                 ret.AuthStatus = 0;
 
-        ret.SessionId = msg.SessionId
-        ret.ServiceEndpoint = "\\\\.\\pipe\\FreeRDS_%d_greeter" % ret.SessionId
+        sessionId = msg.SessionId
+        pipeName = None
+        if ret.AuthStatus != 0:
+            (sessionId, pipeName) = self.server.retrieveGreeter(msg.Username, msg.Domain, sessionId)
+        else:
+            pipeName = self.server.retrieveDesktop(sessionId)
+            
+        ret.SessionId = sessionId
+        ret.ServiceEndpoint = "\\\\.\\pipe\\%s" % pipeName
         return ret
       
     def DisconnectUserSession(self, msg):
@@ -70,59 +164,166 @@ class ProtobufHandler(SocketServer.BaseRequestHandler):
         ret.disconnected = True
         return ret
     
-    def treat_request(self, rpcbase):
-        callbacks = {
-               ICP_pb2.IsChannelAllowed: (self.IsChannelAllowed, ICP_pb2.IsChannelAllowedRequest), 
-               ICP_pb2.GetUserSession: (self.GetUserSession, ICP_pb2.GetUserSessionRequest),
-               ICP_pb2.LogonUser: (self.LogonUser, ICP_pb2.LogonUserRequest),
-               ICP_pb2.DisconnectUserSession: (self.DisconnectUserSession, ICP_pb2.DisconnectUserSessionRequest),
-        }
-        
-        cbInfos = callbacks.get(rpcbase.msgType, None)         
-        if cbInfos is None:
-            print "unknown callback %s" % rpcbase.msgType
-            return None
-        (cb, ctor) = cbInfos 
-        obj = ctor()
-        obj.ParseFromString(rpcbase.payload)
-        return cb(obj)
-        
-        
-    def treat_response(self, rpcBase):
-        print "treat_response()"
-        pass    
-        
-    
-    def handle(self):
-        while True:
-            lenBytes = self.request.recv(4)
-            if not len(lenBytes):
-                break            
-            msgLen = struct.unpack("!i", lenBytes)[0]
-            
-            msg = self.request.recv(msgLen)
-            baseRpc = pbRPC_pb2.RPCBase()
-            baseRpc.ParseFromString(msg)
-            if baseRpc.isResponse:
-                self.treat_response(baseRpc)
-            else:
-                ret = self.treat_request(baseRpc)
-                if ret:
-                    baseRpc.status = pbRPC_pb2.RPCBase.SUCCESS
-                    baseRpc.isResponse = True
-                    baseRpc.payload = ret.SerializeToString()
-                    response = baseRpc.SerializeToString()
-                    self.request.send( struct.pack("!i", len(response)) )                  
-                    self.request.send( response )
-                                
 
-if __name__ == "__main__": 
-    fullPath = os.path.join(pipeDir, "FreeRDS_SessionManager")
-    if not os.path.exists(pipeDir):
-        os.mkdir(pipeDir)
-    if os.path.exists(fullPath):
-        os.remove(fullPath)
+class FreeRdsSession(object):
+    def __init__(self, sessionId, user, domain):
+        self.id = sessionId
+        self.login = user
+        self.domain = domain
+        self.authenticated = False
+        self.greeter_pipe = None
+        self.greeter_pid = -1
+        self.desktop_pipe = None
+        self.desktop_pid = -1
+        
+
+class SessionManagerServer(SocketServer.ThreadingUnixStreamServer):
+    '''
+        @summary: 
+    '''
     
-    server = SocketServer.ThreadingUnixStreamServer(fullPath, ProtobufHandler)
+    def __init__(self, config):
+        '''
+            @param config: the global configuration 
+        '''
+        self.config = config
+        self.sessions = {}
+        if not os.path.exists(config.global_pipesDirectory):
+            os.makedirs(config.global_pipesDirectory)
+            
+        server_address = os.path.join(config.global_pipesDirectory, config.global_listeningPipe)
+        if os.path.exists(server_address):
+            os.remove(server_address)
+                
+        SocketServer.ThreadingUnixStreamServer.__init__(self, server_address, IcpHandler)
+        
+    def launchByTemplate(self, template, sessionId, appName, appPath):
+        if template == "qt":
+            providerCtor = content_provider.QtContentProvider
+        elif template == "weston":
+            providerCtor = content_provider.WestonContentProvider
+        else:
+            print "%s not handled yet using generic"
+            providerCtor = content_provider.SessionManagerContentProvider
+        
+        provider = providerCtor(appName, appPath, [])
+        return provider.launch(self.config, sessionId, [])            
+        
+        
+    def retrieveGreeter(self, username, domain, sessionId):
+        session = None
+        if sessionId: # a SessionId set to 0 means that the session does not exist yet
+            session = self.sessions.get(sessionId, None)
+        else:
+            sessionId = 1
+        
+        if not session: 
+            # scan existing sessions
+            for s in self.sessions.values():
+                if (s.login == username) and (s.domain == domain):
+                    sessionId = s.id
+                    session = s
+                    break
+                    
+        if not session:
+            # allocate a new one
+            while self.sessions.get(sessionId, None):
+                sessionId += 1
+                
+            session = FreeRdsSession(sessionId, username, domain)
+            self.sessions[sessionId] = session
+        
+        if not session.greeter_pipe:
+            ret = self.launchByTemplate(self.config.greeter_template, sessionId, 
+                                        "greeter", self.config.greeter_path)
+            if not ret:
+                print "Fail to launch a greeter"
+            (session.greeter_pid, session.greeter_pipe) = ret 
+        return (sessionId, session.greeter_pipe)
+            
+    def retrieveDesktop(self, sessionId):
+        session = self.sessions.get(sessionId, None)
+        if not session:
+            print "Fatal error, session not found"
+            
+        if not session.desktop_pipe:
+            ret = self.launchByTemplate(self.config.desktop_template, sessionId, 
+                                        "desktop", self.config.desktop_path)
+            if not ret:
+                print "Fail to launch a desktop"
+                return None
+            (session.desktop_pid, session.desktop_pipe) = ret 
+        return session.desktop_pipe
+        
+        
+
+DEFAULT_CONFIG = {
+    'global': {
+        'pipesDirectory': '/tmp/.pipe',
+        'listeningPipe': 'FreeRDS_SessionManager',
+        'ld_library_path': [],
+        'pipeTimeout': 10,
+    },
+                  
+    'qt': {
+        'pluginsPath': None,
+        'variableName': 'FREERDS_PIPE_PATH',
+        'initialGeometry': '800x600',
+    },
+                  
+    'weston': {
+        'initialGeometry': '1024x768',
+    },
+    
+    'greeter': {
+        'template': 'qt',
+        'path': None,
+    },
+    
+    'desktop': {
+        'template': 'weston',
+        'path': None
+    }
+}
+
+class SessionManagerConfig(object):
+    def __init__(self):
+        self.global_pipesDirectory = None
+        self.global_listeningPipe = None
+        self.ld_library_path = None
+        self.pipeTimeout = None
+        
+        self.qt_pluginsPath = None
+        self.qt_variableName = None
+        self.qt_initialGeometry = None
+        
+        self.weston_initialGeometry = None
+        
+        self.greeter_template = None
+        self.greeter_path = None
+
+        self.desktop_template = None
+        self.desktop_path = None
+        
+
+    def loadFromFile(self, fname):
+        ''' load JSON configuration from frm the given filename
+            @param fname: the name of the configuration file 
+        '''        
+        config = json.load(open(fname, "r"))
+        
+        for topK, defaultTopValues in DEFAULT_CONFIG.items():
+            localConfig = config.get(topK, {})
+                
+            for k, defaultV in defaultTopValues.items():
+                v = localConfig.get(k, defaultV)            
+                setattr(self, topK + '_' + k, v)        
+            
+              
+if __name__ == "__main__":
+    mainConfig = SessionManagerConfig()
+    mainConfig.loadFromFile(sys.argv[1])
+        
+    server = SessionManagerServer(mainConfig)
     server.serve_forever()
     
