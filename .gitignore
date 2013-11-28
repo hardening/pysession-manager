@@ -1,3 +1,4 @@
 *.pyc
-pbRPC_pb2.py
-ICP_pb2.py
+/pbRPC_pb2.py
+/ICP_pb2.py
+/ICPS_pb2.py
