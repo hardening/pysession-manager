@@ -14,7 +14,7 @@ ICP_METHODS_TO_BIND = ("IsChannelAllowed", "Ping", "DisconnectUserSession",
     "LogOffUserSession", "FdsApiVirtualChannelOpen", "LogonUser",
 )
 
-ICPS_METHODS_TO_BIND = ("AuthenticateUser", )
+ICPS_METHODS_TO_BIND = ("AuthenticateUser", 'EndSession',)
 
 def buildMethodDescriptor(module, methods):
     ret = {}
@@ -72,7 +72,7 @@ class PbRpcHandler(SocketServer.BaseRequestHandler):
         '''
         pbRpc.status = pbRPC_pb2.RPCBase.NOTFOUND
         pbRpc.isResponse = True
-        pbRpc.payload = None
+        pbRpc.payload = ''
         response = pbRpc.SerializeToString()
         self.request.send( struct.pack("!i", len(response)) )                  
         self.request.send( response )
@@ -81,13 +81,13 @@ class PbRpcHandler(SocketServer.BaseRequestHandler):
     def treat_request(self, pbRpc):
         cbInfos = self.methodMapper.get(pbRpc.msgType, None)         
         if cbInfos is None:
-            print "unknown method with id=%s" % pbRpc.msgType
+            print "PbRpcHandler(): unknown method with id=%s" % pbRpc.msgType
             return self.answer404(pbRpc)                        
         
         (methodName, ctor) = cbInfos
         toCall = getattr(self, methodName, None)
         if not callable(toCall):
-            print "unknown method with id=%s" % pbRpc.msgType
+            print "PbRpcHandler(): unknown method with id=%s" % pbRpc.msgType
             return self.answer404(pbRpc)                        
                      
         obj = ctor()
@@ -164,6 +164,21 @@ class SwitchPipeHandler(PbRpcResponseHandler):
             print "error treating switchPipe()"
         
 
+class LogoffHandler(PbRpcResponseHandler):
+    '''
+        @summary: a context object to handle a LogOffUser transaction
+    '''
+    
+    def __init__(self, reqHandler, session):
+        PbRpcResponseHandler.__init__(self, reqHandler, ICP_pb2.LogOffUserSessionResponse)
+    
+    def onResponse(self, status, response):
+        if response:
+            print "LogoffHandler result: %s" % response.loggedoff
+        else:
+            print "error treating LogoffHandler()"
+
+
 class IcpHandler(PbRpcHandler):
     '''
         @summary: a handler that will take care of ICP messages
@@ -193,7 +208,17 @@ class IcpHandler(PbRpcHandler):
             
         ret.ServiceEndpoint = "\\\\.\\pipe\\%s" % pipeName
         return ret
+
+    def DisconnectUserSession(self, msg):
+        print "DisconnectUserSession(%s)" % msg.ConnectionId
+        ret = ICP_pb2.DisconnectUserSessionResponse()
+        ret.disconnected = True
+        return ret
     
+    #
+    #    ICPS API
+    #
+     
     def AuthenticateUser(self, msg):        
         user = msg.username
         password = msg.password
@@ -208,6 +233,8 @@ class IcpHandler(PbRpcHandler):
             ret.authStatus = ICPS_pb2.AuthenticateUserResponse.AUTH_INVALID_PARAMETER
             return ret         
         
+        # uncomment this line if you would like to see the nice effect when authenticating
+        #time.sleep(1)  
         if self.server.authenticate(user, password, domain):
             session.login = user
             session.domain = domain
@@ -227,10 +254,21 @@ class IcpHandler(PbRpcHandler):
             ret.serviceEndpoint = ""            
         return ret
       
-    def DisconnectUserSession(self, msg):
-        print "DisconnectUserSession(%s)" % msg.ConnectionId
-        ret = ICP_pb2.DisconnectUserSessionResponse()
-        ret.disconnected = True
+    def EndSession(self, msg):
+        print "EndSession(%s)" % msg.sessionId
+        session = self.server.retrieveSession(msg.sessionId)
+        
+        ret = ICPS_pb2.EndSessionResponse()
+        if session is None or session.connectionId is None:
+            ret.success = False
+            return ret
+        
+        ret.success = True        
+        disconnectHandler = LogoffHandler(self, session)
+        logoffReq = ICP_pb2.LogOffUserSessionRequest()
+        logoffReq.ConnectionId = session.connectionId
+        self.scheduleRequest(ICP_pb2.LogOffUserSession, logoffReq.SerializeToString(), 
+                             disconnectHandler)            
         return ret
 
 

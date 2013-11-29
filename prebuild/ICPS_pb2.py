@@ -11,7 +11,7 @@ from google.protobuf import descriptor_pb2
 DESCRIPTOR = descriptor.FileDescriptor(
   name='ICPS.proto',
   package='freerds.icps',
-  serialized_pb='\n\nICPS.proto\x12\x0c\x66reerds.icps\"`\n\x17\x41uthenticateUserRequest\x12\x11\n\tsessionId\x18\x01 \x02(\r\x12\x10\n\x08username\x18\x02 \x02(\t\x12\x10\n\x08password\x18\x03 \x02(\t\x12\x0e\n\x06\x64omain\x18\x04 \x02(\t\"\xd5\x01\n\x18\x41uthenticateUserResponse\x12\x46\n\nauthStatus\x18\x01 \x02(\x0e\x32\x32.freerds.icps.AuthenticateUserResponse.AUTH_STATUS\x12\x17\n\x0fserviceEndpoint\x18\x02 \x01(\t\"X\n\x0b\x41UTH_STATUS\x12\x14\n\x10\x41UTH_SUCCESSFULL\x10\x00\x12\x17\n\x13\x41UTH_BAD_CREDENTIAL\x10\x01\x12\x1a\n\x16\x41UTH_INVALID_PARAMETER\x10\x02* \n\x07MSGTYPE\x12\x15\n\x10\x41uthenticateUser\x10\xc8\x01')
+  serialized_pb='\n\nICPS.proto\x12\x0c\x66reerds.icps\"`\n\x17\x41uthenticateUserRequest\x12\x11\n\tsessionId\x18\x01 \x02(\r\x12\x10\n\x08username\x18\x02 \x02(\t\x12\x10\n\x08password\x18\x03 \x02(\t\x12\x0e\n\x06\x64omain\x18\x04 \x02(\t\"\xb9\x01\n\x18\x41uthenticateUserResponse\x12\x46\n\nauthStatus\x18\x01 \x02(\x0e\x32\x32.freerds.icps.AuthenticateUserResponse.AUTH_STATUS\x12\x17\n\x0fserviceEndpoint\x18\x02 \x01(\t\"<\n\x0b\x41UTH_STATUS\x12\x14\n\x10\x41UTH_SUCCESSFULL\x10\x00\x12\x17\n\x13\x41UTH_BAD_CREDENTIAL\x10\x01\"&\n\x11\x45ndSessionRequest\x12\x11\n\tsessionId\x18\x01 \x02(\r\"%\n\x12\x45ndSessionResponse\x12\x0f\n\x07success\x18\x01 \x02(\x08*1\n\x07MSGTYPE\x12\x15\n\x10\x41uthenticateUser\x10\xc8\x01\x12\x0f\n\nEndSession\x10\xc9\x01')
 
 _MSGTYPE = descriptor.EnumDescriptor(
   name='MSGTYPE',
@@ -23,15 +23,20 @@ _MSGTYPE = descriptor.EnumDescriptor(
       name='AuthenticateUser', index=0, number=200,
       options=None,
       type=None),
+    descriptor.EnumValueDescriptor(
+      name='EndSession', index=1, number=201,
+      options=None,
+      type=None),
   ],
   containing_type=None,
   options=None,
-  serialized_start=342,
-  serialized_end=374,
+  serialized_start=393,
+  serialized_end=442,
 )
 
 
 AuthenticateUser = 200
+EndSession = 201
 
 
 _AUTHENTICATEUSERRESPONSE_AUTH_STATUS = descriptor.EnumDescriptor(
@@ -48,15 +53,11 @@ _AUTHENTICATEUSERRESPONSE_AUTH_STATUS = descriptor.EnumDescriptor(
       name='AUTH_BAD_CREDENTIAL', index=1, number=1,
       options=None,
       type=None),
-    descriptor.EnumValueDescriptor(
-      name='AUTH_INVALID_PARAMETER', index=2, number=2,
-      options=None,
-      type=None),
   ],
   containing_type=None,
   options=None,
   serialized_start=252,
-  serialized_end=340,
+  serialized_end=312,
 )
 
 
@@ -141,13 +142,71 @@ _AUTHENTICATEUSERRESPONSE = descriptor.Descriptor(
   is_extendable=False,
   extension_ranges=[],
   serialized_start=127,
-  serialized_end=340,
+  serialized_end=312,
+)
+
+
+_ENDSESSIONREQUEST = descriptor.Descriptor(
+  name='EndSessionRequest',
+  full_name='freerds.icps.EndSessionRequest',
+  filename=None,
+  file=DESCRIPTOR,
+  containing_type=None,
+  fields=[
+    descriptor.FieldDescriptor(
+      name='sessionId', full_name='freerds.icps.EndSessionRequest.sessionId', index=0,
+      number=1, type=13, cpp_type=3, label=2,
+      has_default_value=False, default_value=0,
+      message_type=None, enum_type=None, containing_type=None,
+      is_extension=False, extension_scope=None,
+      options=None),
+  ],
+  extensions=[
+  ],
+  nested_types=[],
+  enum_types=[
+  ],
+  options=None,
+  is_extendable=False,
+  extension_ranges=[],
+  serialized_start=314,
+  serialized_end=352,
+)
+
+
+_ENDSESSIONRESPONSE = descriptor.Descriptor(
+  name='EndSessionResponse',
+  full_name='freerds.icps.EndSessionResponse',
+  filename=None,
+  file=DESCRIPTOR,
+  containing_type=None,
+  fields=[
+    descriptor.FieldDescriptor(
+      name='success', full_name='freerds.icps.EndSessionResponse.success', index=0,
+      number=1, type=8, cpp_type=7, label=2,
+      has_default_value=False, default_value=False,
+      message_type=None, enum_type=None, containing_type=None,
+      is_extension=False, extension_scope=None,
+      options=None),
+  ],
+  extensions=[
+  ],
+  nested_types=[],
+  enum_types=[
+  ],
+  options=None,
+  is_extendable=False,
+  extension_ranges=[],
+  serialized_start=354,
+  serialized_end=391,
 )
 
 _AUTHENTICATEUSERRESPONSE.fields_by_name['authStatus'].enum_type = _AUTHENTICATEUSERRESPONSE_AUTH_STATUS
 _AUTHENTICATEUSERRESPONSE_AUTH_STATUS.containing_type = _AUTHENTICATEUSERRESPONSE;
 DESCRIPTOR.message_types_by_name['AuthenticateUserRequest'] = _AUTHENTICATEUSERREQUEST
 DESCRIPTOR.message_types_by_name['AuthenticateUserResponse'] = _AUTHENTICATEUSERRESPONSE
+DESCRIPTOR.message_types_by_name['EndSessionRequest'] = _ENDSESSIONREQUEST
+DESCRIPTOR.message_types_by_name['EndSessionResponse'] = _ENDSESSIONRESPONSE
 
 class AuthenticateUserRequest(message.Message):
   __metaclass__ = reflection.GeneratedProtocolMessageType
@@ -160,5 +219,17 @@ class AuthenticateUserResponse(message.Message):
   DESCRIPTOR = _AUTHENTICATEUSERRESPONSE
   
   # @@protoc_insertion_point(class_scope:freerds.icps.AuthenticateUserResponse)
+
+class EndSessionRequest(message.Message):
+  __metaclass__ = reflection.GeneratedProtocolMessageType
+  DESCRIPTOR = _ENDSESSIONREQUEST
+  
+  # @@protoc_insertion_point(class_scope:freerds.icps.EndSessionRequest)
+
+class EndSessionResponse(message.Message):
+  __metaclass__ = reflection.GeneratedProtocolMessageType
+  DESCRIPTOR = _ENDSESSIONRESPONSE
+  
+  # @@protoc_insertion_point(class_scope:freerds.icps.EndSessionResponse)
 
 # @@protoc_insertion_point(module_scope)
