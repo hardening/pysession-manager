@@ -25,6 +25,7 @@
 	    
 	"desktop": {
 		"template": "weston",
-	    "path": "/home/david/dev/git/weston/output/src/weston"
+	    "path": "/home/david/dev/install/bin/weston"
 	}
+
 }

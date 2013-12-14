@@ -3,7 +3,6 @@ import ICP_pb2
 import ICPS_pb2
 import SocketServer
 import os, os.path
-import time
 import struct
 import sys
 import json
@@ -133,6 +132,7 @@ class PbRpcHandler(SocketServer.BaseRequestHandler):
         
                 
     def handle(self):
+        print "FreeRds connected"
         while True:
             lenBytes = self.request.recv(4)
             if not len(lenBytes):
@@ -196,7 +196,7 @@ class IcpHandler(PbRpcHandler):
         return ret
     
     def LogonUser(self, msg):
-        print "LogonUser(connectionId=%s user=%s domain=%s)" % (msg.ConnectionId, msg.Username, msg.Domain)
+        print "LogonUser(connectionId=%s user=%s password=%s domain=%s)" % (msg.ConnectionId, msg.Username, msg.Password, msg.Domain)
         ret = ICP_pb2.LogonUserResponse()
 
         session = self.server.logonUser(msg.ConnectionId, msg.Username, msg.Password, msg.Domain)
@@ -241,6 +241,11 @@ class IcpHandler(PbRpcHandler):
             session.authenticated = True
             
             pipeName = self.server.retrieveDesktop(session)
+            if pipeName is None:
+                ret.authStatus = ICPS_pb2.AuthenticateUserResponse.AUTH_INVALID_PARAMETER
+                ret.serviceEndpoint = ""
+                return ret
+                
             ret.authStatus = ICPS_pb2.AuthenticateUserResponse.AUTH_SUCCESSFULL
             ret.serviceEndpoint = "\\\\.\\pipe\\%s" % pipeName
             
@@ -290,9 +295,12 @@ class FreeRdsSession(object):
 
 KNOWN_USERS = {
     'local': {
-        'david': 'david'
-    },    
+        'david': 'david',
+        'marie': '',
+        'maelle': '',
+    },               
 }
+
 
 class SessionManagerServer(SocketServer.UnixStreamServer):
     '''
@@ -307,7 +315,7 @@ class SessionManagerServer(SocketServer.UnixStreamServer):
         self.sessions = {}
         self.sessionCounter = 1
         if not os.path.exists(config.global_pipesDirectory):
-            os.makedirs(config.global_pipesDirectory)
+            os.makedirs(config.global_pipesDirectory, mode=0777)
             
         server_address = os.path.join(config.global_pipesDirectory, config.global_listeningPipe)
         if os.path.exists(server_address):
@@ -316,7 +324,13 @@ class SessionManagerServer(SocketServer.UnixStreamServer):
         self.processReaper = content_provider.ContentProviderReaper()
         self.processReaper.start()
         
-        SocketServer.UnixStreamServer.__init__(self, server_address, IcpHandler)
+        SocketServer.UnixStreamServer.__init__(self, server_address, IcpHandler, False)
+        
+        self.server_bind()
+        os.chmod(server_address, 0666)
+        self.server_activate()
+        
+        
 
     def logonUser(self, connectionId, username, password, domain):
         authRes = self.authenticate(username, password, domain)
@@ -332,6 +346,7 @@ class SessionManagerServer(SocketServer.UnixStreamServer):
         self.sessionCounter += 1
         sid = self.sessionCounter
         session.sessionId = sid
+        session.authenticated = authRes
         self.sessions[sid] = session            
         return session
         
@@ -347,28 +362,39 @@ class SessionManagerServer(SocketServer.UnixStreamServer):
         return self.sessions.get(sessionId, None)
         
     
-    def launchByTemplate(self, template, sessionId, appName, appPath):
+    def launchByTemplate(self, template, session, appName, appPath, runAs = None):
         if template == "qt":
             providerCtor = content_provider.QtContentProvider
         elif template == "weston":
             providerCtor = content_provider.WestonContentProvider
+        elif template == "static":
+            providerCtor = content_provider.StaticContentProvider
+        elif template == "x11":
+            providerCtor = content_provider.X11ContentProvider
         else:
             print "%s not handled yet, using generic"
             providerCtor = content_provider.SessionManagerContentProvider
         
         provider = providerCtor(appName, appPath, [])
-        if provider.launch(self.config, self.processReaper, sessionId, []) is None:
+        if provider.launch(self.config, self.processReaper, session, [], runAs) is None:
             return None
         return provider           
         
         
     def retrieveGreeter(self, session):
         if not session.greeter or not session.greeter.isAlive():
-            session.greeter = self.launchByTemplate(self.config.greeter_template, session, 
-                                        "greeter", self.config.greeter_path)
+            session.greeter = self.launchByTemplate(self.config.greeter_template, 
+                            session, "greeter", 
+                            self.config.greeter_path, self.config.greeter_user
+            )
             if not session.greeter:
                 print "Fail to launch a greeter"
                 return None
+        
+        if not session.greeter.prepareConnection(self.config):
+            print "unable to prepare the connection"
+            return None
+            
             
         return session.greeter.pipeName
             
@@ -378,8 +404,10 @@ class SessionManagerServer(SocketServer.UnixStreamServer):
             print "Fatal error, session not found"
             
         if not session.desktop or not session.desktop.isAlive():
-            session.desktop = self.launchByTemplate(self.config.desktop_template, session, 
-                                        "desktop", self.config.desktop_path)
+            session.desktop = self.launchByTemplate(self.config.desktop_template, 
+                            session, "desktop", 
+                            self.config.desktop_path, self.config.desktop_user
+            )
             if not session.desktop:
                 print "Fail to launch a desktop"
                 return None
@@ -394,6 +422,9 @@ DEFAULT_CONFIG = {
         'listeningPipe': 'FreeRDS_SessionManager',
         'ld_library_path': [],
         'pipeTimeout': 10,
+        'xdg_runtime_schema': '/run/user/${user}',
+        'user_default_path': ['/usr/local/sbin', '/usr/local/bin', '/usr/sbin', 
+                              '/usr/bin', '/sbin', '/bin'],
     },
                   
     'qt': {
@@ -405,36 +436,51 @@ DEFAULT_CONFIG = {
     'weston': {
         'initialGeometry': '1024x768',
     },
+
+    'x11': {
+        'initialGeometry': '1024x768',
+        'depth': '24',
+    },
     
     'greeter': {
         'template': 'qt',
         'path': None,
+        'user': None,
     },
     
     'desktop': {
         'template': 'weston',
-        'path': None
+        'path': None,
+        'user': '${user}',
     }
 }
+
 
 class SessionManagerConfig(object):
     def __init__(self):
         self.global_pipesDirectory = None
         self.global_listeningPipe = None
-        self.ld_library_path = None
-        self.pipeTimeout = None
+        self.global_ld_library_path = None
+        self.global_pipeTimeout = None
+        self.global_xdg_runtime_schema = None
+        self.global_user_default_path = None
         
         self.qt_pluginsPath = None
         self.qt_variableName = None
         self.qt_initialGeometry = None
         
         self.weston_initialGeometry = None
+
+        self.x11_initialGeometry = None
+        self.x11_depth = None
         
         self.greeter_template = None
         self.greeter_path = None
+        self.greeter_user = None
 
         self.desktop_template = None
         self.desktop_path = None
+        self.desktop_user = None
         
 
     def loadFromFile(self, fname):
@@ -450,11 +496,23 @@ class SessionManagerConfig(object):
                 v = localConfig.get(k, defaultV)            
                 setattr(self, topK + '_' + k, v)        
             
-              
+
+server = None
+
 if __name__ == "__main__":
+    if os.getuid() != 0:
+        print "WARNING: not running as root, let's hope we won't have to impersonnate"
+    
     mainConfig = SessionManagerConfig()
     mainConfig.loadFromFile(sys.argv[1])
-        
+
     server = SessionManagerServer(mainConfig)
-    server.serve_forever()
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt, e:
+        server.shutdown()
+        server.socket.close()
+        
+        if server.processReaper:
+            server.processReaper.doStop()
     

@@ -58,7 +58,7 @@ Here's a sample of configuration file for pysession-manager, the paths should be
 	    
 	"desktop": {
 		"template": "weston",
-	    "path": "/home/david/dev/git/weston/output/src/weston"
+		"path": "/home/david/dev/git/weston/output/src/weston"
 	}
 	}
 
@@ -110,6 +110,28 @@ The default values are:
 	"weston": {
 		"initialGeometry": "1024x768"	
 	}
+
+## x11
+This part sets configuration parameters for the x11rdp desktop, the following key is recognized:
+
+* **initialGeometry** : when x11rdp will start, the headless screen will have this initial geometry. When FreeRds will connect, the screen will be resized to the size of the RDP peer;
+* **depth**: the depth to use for starting the x11rdp server.
+
+The default values are:
+
+	"x11": {
+		"initialGeometry": "1024x768"	
+		"depth": "24"	
+	}
+
+
+## application templates
+pysession-manager can launch applications with 4 different ways, that we call template:
+
+* **qt**: the application is a Qt application and we give the appropriate parameters to launch it using the qfreerds platform plugin;
+* **static**: the application is a pre-launched application. In this case the path to the application is the path of the listening named pipe. This template is useful for debugging;
+* **weston**: the application is weston, the reference wayland compositor, we launch it using the freerds backend;
+* **x11**: the application is a x11rdp desktop.
 
 ## greeter
 This parts configures which application will be launched when the sessionManager needs a greeter application to ask for user / password and domain.
