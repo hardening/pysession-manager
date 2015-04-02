@@ -1,5 +1,5 @@
 
-SRC_PROTO=../FreeRds/server/FreeRDS/protocols/protobuf/
+SRC_PROTO=../FreeRDS-REWE/protocols/protobuf/
 
 OUT_DIR=protobuf
 protobuf_files: $(SRC_PROTO)/pbRPC.proto $(SRC_PROTO)/ICP.proto  $(SRC_PROTO)/ICPS.proto 

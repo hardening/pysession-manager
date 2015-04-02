@@ -1,430 +1,51 @@
-import pbRPC_pb2
-import ICP_pb2
-import ICPS_pb2
-import SocketServer
-import os, os.path
-import struct
-import sys
-import json
+import os.path
+import sys, time
 import content_provider
+import signal
+import dbus, dbus.service
+import random, string
+import types
+from dbus.mainloop.glib import DBusGMainLoop
+import wtsapi
+import logging
+import logging.config
 
+sys.path.append('gen-py.twisted')
 
-ICP_METHODS_TO_BIND = ("IsChannelAllowed", "Ping", "DisconnectUserSession", 
-    "LogOffUserSession", "FdsApiVirtualChannelOpen", "LogonUser",
-)
+from twisted.internet import reactor, ssl
+from icp_server import IcpFactory
+import thrift_server
+from OpenSSL import SSL
 
-ICPS_METHODS_TO_BIND = ("AuthenticateUser", 'EndSession',)
-
-def buildMethodDescriptor(module, methods):
-    ret = {}
-    for messageIdName in methods:
-        messageId = getattr(module, messageIdName, None)
-        if messageId is None:
-            print "unable to retrieve %s" % messageIdName
-            continue
-        
-        reqCtor = getattr(module, messageIdName + "Request", None)
-        if reqCtor is None:
-            print "unable to retrieve %sRequest" % messageIdName
-            continue
-        ret[messageId] = (messageIdName, reqCtor)
-    return ret
-        
-class PbRpcResponseHandler(object):
-    '''
-        @summary: base class for a pbRpc transaction context
-    '''
-    def __init__(self, reqHandler, responseCtor):
-        self.reqHandler = reqHandler
-        self.ctor = responseCtor
-        
-    def handle(self, status, payload):
-        response = None
-        if payload:
-            response = self.ctor()
-            response.ParseFromString(payload)
-        self.onResponse(status, response)
-        
-    def onResponse(self, status, response):
-        pass
-
-
-class PbRpcHandler(SocketServer.BaseRequestHandler):
-    '''
-        @summary: a base class to handle the protobuf RPC protocol that is spoken
-                  between FreeRDS and the sessionManager
-    '''
-
-    def __init__(self, *args, **kwargs):
-        self.requestsToInitiate = []
-        self.requestsInProgress = {}
-        self.tagCounter = 1
-        SocketServer.BaseRequestHandler.__init__(self, *args, **kwargs)
-            
-    def scheduleRequest(self, reqType, payload, handler):
-        self.requestsToInitiate.append( (reqType, payload, handler) )
-    
-    def answer404(self, pbRpc):
-        ''' answers a "404 not found" like message in the pcbRpc terminology
-            @param pbRpc: the incoming request that will be used to forge an answer
-            @return: 404 as error code 
-        '''
-        pbRpc.status = pbRPC_pb2.RPCBase.NOTFOUND
-        pbRpc.isResponse = True
-        pbRpc.payload = ''
-        response = pbRpc.SerializeToString()
-        self.request.send( struct.pack("!i", len(response)) )                  
-        self.request.send( response )
-        return 404            
-    
-    def treat_request(self, pbRpc):
-        cbInfos = self.methodMapper.get(pbRpc.msgType, None)         
-        if cbInfos is None:
-            print "PbRpcHandler(): unknown method with id=%s" % pbRpc.msgType
-            return self.answer404(pbRpc)                        
-        
-        (methodName, ctor) = cbInfos
-        toCall = getattr(self, methodName, None)
-        if not callable(toCall):
-            print "PbRpcHandler(): unknown method with id=%s" % pbRpc.msgType
-            return self.answer404(pbRpc)                        
-                     
-        obj = ctor()
-        obj.ParseFromString(pbRpc.payload)
-
-        ret = toCall(obj)
-        if ret:
-            pbRpc.status = pbRPC_pb2.RPCBase.SUCCESS
-            pbRpc.isResponse = True
-            pbRpc.payload = ret.SerializeToString()
-            response = pbRpc.SerializeToString()
-            self.request.send( struct.pack("!i", len(response)) )                  
-            self.request.send( response )
-
-        for (icpType, payload, cb) in self.requestsToInitiate:
-            self.tagCounter += 1
-            tag = self.tagCounter
-                        
-            req = pbRPC_pb2.RPCBase()
-            req.msgType = icpType
-            req.tag = tag
-            req.isResponse = False
-            req.status = pbRPC_pb2.RPCBase.SUCCESS
-            req.payload = payload
-
-            self.requestsInProgress[tag] = cb
-            
-            requestContent = req.SerializeToString()
-            self.request.send( struct.pack("!i", len(requestContent)) )                  
-            self.request.send( requestContent )
-        
-        self.requestsToInitiate = []                    
-        return 200
-        
-    def treat_response(self, msg):
-        reqContext = self.requestsInProgress.get(msg.tag, None)
-        if not reqContext:
-            print "treat_response(): receiving a response(tag=%d type=%d) but no request is registered here" % (msg.tag, msg.msgType)
-            return
-                
-        del self.requestsInProgress[msg.tag]
-        reqContext.handle(msg.status, msg.payload)
-        
-                
-    def handle(self):
-        print "FreeRds connected"
-        while True:
-            lenBytes = self.request.recv(4)
-            if not len(lenBytes):
-                break            
-            msgLen = struct.unpack("!i", lenBytes)[0]
-            
-            msg = self.request.recv(msgLen)
-            baseRpc = pbRPC_pb2.RPCBase()
-            baseRpc.ParseFromString(msg)
-            
-            if baseRpc.isResponse:
-                self.treat_response(baseRpc)
-            else:
-                self.treat_request(baseRpc)
-                
-
-class SwitchPipeHandler(PbRpcResponseHandler):
-    '''
-        @summary: a context object to handle a switchPipe ICP transaction
-    '''
-    
-    def __init__(self, reqHandler, session, pipeName):
-        PbRpcResponseHandler.__init__(self, reqHandler, ICP_pb2.SwitchToResponse)
-    
-    def onResponse(self, status, response):
-        if response:
-            print "switchPipe result: %d" % response.success
-        else:
-            print "error treating switchPipe()"
-        
-
-class LogoffHandler(PbRpcResponseHandler):
-    '''
-        @summary: a context object to handle a LogOffUser transaction
-    '''
-    
-    def __init__(self, reqHandler, session):
-        PbRpcResponseHandler.__init__(self, reqHandler, ICP_pb2.LogOffUserSessionResponse)
-    
-    def onResponse(self, status, response):
-        if response:
-            print "LogoffHandler result: %s" % response.loggedoff
-        else:
-            print "error treating LogoffHandler()"
-
-
-class IcpHandler(PbRpcHandler):
-    '''
-        @summary: a handler that will take care of ICP messages
-    '''
-        
-    def __init__(self, *params, **kwparams):
-        self.methodMapper = buildMethodDescriptor(ICP_pb2, ICP_METHODS_TO_BIND)
-        self.methodMapper.update(buildMethodDescriptor(ICPS_pb2, ICPS_METHODS_TO_BIND))
-        PbRpcHandler.__init__(self, *params, **kwparams)
-                    
-    def IsChannelAllowed(self, msg):
-        print "IsChannelAllowed(%s)" % msg.ChannelName
-        ret = ICP_pb2.IsChannelAllowedResponse()
-        ret.ChannelAllowed = True
-        return ret
-    
-    def LogonUser(self, msg):
-        print "LogonUser(connectionId=%s user=%s password=%s domain=%s)" % (msg.ConnectionId, msg.Username, msg.Password, msg.Domain)
-        ret = ICP_pb2.LogonUserResponse()
-
-        session = self.server.logonUser(msg.ConnectionId, msg.Username, msg.Password, msg.Domain)
-        pipeName = None
-        if not session.isAuthenticated():                        
-            pipeName = self.server.retrieveGreeter(session)
-        else:
-            pipeName = self.server.retrieveDesktop(session)
-            
-        ret.ServiceEndpoint = "\\\\.\\pipe\\%s" % pipeName
-        return ret
-
-    def DisconnectUserSession(self, msg):
-        print "DisconnectUserSession(%s)" % msg.ConnectionId
-        ret = ICP_pb2.DisconnectUserSessionResponse()
-        ret.disconnected = True
-        return ret
-    
-    #
-    #    ICPS API
-    #
-     
-    def AuthenticateUser(self, msg):        
-        user = msg.username
-        password = msg.password
-        domain = msg.domain
-        print "Authenticate(sessionId=%s user=%s password=%s domain=%s)" % (msg.sessionId, user, password, domain)
-        
-        ret = ICPS_pb2.AuthenticateUserResponse()
-
-        session = self.server.retrieveSession(msg.sessionId)
-        if session is None:
-            print "Authenticate(): no such session %s" % msg.sessionId
-            ret.authStatus = ICPS_pb2.AuthenticateUserResponse.AUTH_INVALID_PARAMETER
-            return ret         
-        
-        # uncomment this line if you would like to see the nice effect when authenticating
-        #time.sleep(1)  
-        if self.server.authenticate(user, password, domain):
-            session.login = user
-            session.domain = domain
-            session.authenticated = True
-            
-            pipeName = self.server.retrieveDesktop(session)
-            if pipeName is None:
-                ret.authStatus = ICPS_pb2.AuthenticateUserResponse.AUTH_INVALID_PARAMETER
-                ret.serviceEndpoint = ""
-                return ret
-                
-            ret.authStatus = ICPS_pb2.AuthenticateUserResponse.AUTH_SUCCESSFULL
-            ret.serviceEndpoint = "\\\\.\\pipe\\%s" % pipeName
-            
-            switchHandler = SwitchPipeHandler(self, session, pipeName)
-            switchReq = ICP_pb2.SwitchToRequest()
-            switchReq.connectionId = session.connectionId
-            switchReq.serviceEndpoint = ret.serviceEndpoint
-            self.scheduleRequest(ICP_pb2.SwitchTo, switchReq.SerializeToString(), switchHandler)            
-        else:
-            ret.authStatus = ICPS_pb2.AuthenticateUserResponse.AUTH_BAD_CREDENTIAL
-            ret.serviceEndpoint = ""            
-        return ret
-      
-    def EndSession(self, msg):
-        print "EndSession(%s)" % msg.sessionId
-        session = self.server.retrieveSession(msg.sessionId)
-        
-        ret = ICPS_pb2.EndSessionResponse()
-        if session is None or session.connectionId is None:
-            ret.success = False
-            return ret
-        
-        ret.success = True        
-        disconnectHandler = LogoffHandler(self, session)
-        logoffReq = ICP_pb2.LogOffUserSessionRequest()
-        logoffReq.ConnectionId = session.connectionId
-        self.scheduleRequest(ICP_pb2.LogOffUserSession, logoffReq.SerializeToString(), 
-                             disconnectHandler)            
-        return ret
-
-
-
-class FreeRdsSession(object):
-    def __init__(self, connectionId, user, domain):
-        self.sessionId = 0
-        self.connectionId = connectionId
-        self.login = user
-        self.domain = domain
-        self.authenticated = False
-        self.greeter = None
-        self.desktop = None
-        
-    def getId(self):
-        return self.sessionId
-    def isAuthenticated(self):
-        return self.authenticated
-
-KNOWN_USERS = {
-    'local': {
-        'david': 'david',
-        'marie': '',
-        'maelle': '',
-    },               
-}
-
-
-class SessionManagerServer(SocketServer.UnixStreamServer):
-    '''
-        @summary: the main ICP server listening for FreeRds connections 
-    '''
-    
-    def __init__(self, config):
-        '''
-            @param config: the global configuration 
-        '''
-        self.config = config
-        self.sessions = {}
-        self.sessionCounter = 1
-        if not os.path.exists(config.global_pipesDirectory):
-            os.makedirs(config.global_pipesDirectory, mode=0777)
-            
-        server_address = os.path.join(config.global_pipesDirectory, config.global_listeningPipe)
-        if os.path.exists(server_address):
-            os.remove(server_address)
-              
-        self.processReaper = content_provider.ContentProviderReaper()
-        self.processReaper.start()
-        
-        SocketServer.UnixStreamServer.__init__(self, server_address, IcpHandler, False)
-        
-        self.server_bind()
-        os.chmod(server_address, 0666)
-        self.server_activate()
-        
-        
-
-    def logonUser(self, connectionId, username, password, domain):
-        authRes = self.authenticate(username, password, domain)
-        
-        if authRes:
-            for session in self.sessions.values():
-                if (session.login == username) and (session.domain == domain):
-                    session.authenticated = True
-                    session.connectionId = connectionId
-                    return session
-                        
-        session = FreeRdsSession(connectionId, username, domain)
-        self.sessionCounter += 1
-        sid = self.sessionCounter
-        session.sessionId = sid
-        session.authenticated = authRes
-        self.sessions[sid] = session            
-        return session
-        
-    def authenticate(self, username, password, domain):
-        domainUsers = KNOWN_USERS.get(domain, None)
-        if not domainUsers:
-            return False            
-        
-        localPassword = domainUsers.get(username, None)
-        return localPassword == password
-
-    def retrieveSession(self, sessionId):
-        return self.sessions.get(sessionId, None)
-        
-    
-    def launchByTemplate(self, template, session, appName, appPath, runAs = None):
-        if template == "qt":
-            providerCtor = content_provider.QtContentProvider
-        elif template == "weston":
-            providerCtor = content_provider.WestonContentProvider
-        elif template == "static":
-            providerCtor = content_provider.StaticContentProvider
-        elif template == "x11":
-            providerCtor = content_provider.X11ContentProvider
-        else:
-            print "%s not handled yet, using generic"
-            providerCtor = content_provider.SessionManagerContentProvider
-        
-        provider = providerCtor(appName, appPath, [])
-        if provider.launch(self.config, self.processReaper, session, [], runAs) is None:
-            return None
-        return provider           
-        
-        
-    def retrieveGreeter(self, session):
-        if not session.greeter or not session.greeter.isAlive():
-            session.greeter = self.launchByTemplate(self.config.greeter_template, 
-                            session, "greeter", 
-                            self.config.greeter_path, self.config.greeter_user
-            )
-            if not session.greeter:
-                print "Fail to launch a greeter"
-                return None
-        
-        if not session.greeter.prepareConnection(self.config):
-            print "unable to prepare the connection"
-            return None
-            
-            
-        return session.greeter.pipeName
-            
-    def retrieveDesktop(self, session):
-        session = self.sessions.get(session.getId(), None)
-        if not session:
-            print "Fatal error, session not found"
-            
-        if not session.desktop or not session.desktop.isAlive():
-            session.desktop = self.launchByTemplate(self.config.desktop_template, 
-                            session, "desktop", 
-                            self.config.desktop_path, self.config.desktop_user
-            )
-            if not session.desktop:
-                print "Fail to launch a desktop"
-                return None
- 
-        return session.desktop.pipeName
-        
-        
 
 DEFAULT_CONFIG = {
-    'global': {
+    'globalConfig': {
         'pipesDirectory': '/tmp/.pipe',
-        'listeningPipe': 'FreeRDS_SessionManager',
         'ld_library_path': [],
         'pipeTimeout': 10,
-        'xdg_runtime_schema': '/run/user/${user}',
+        'xdg_runtime_schema': '/run/user/${runAsUserId}',
         'user_default_path': ['/usr/local/sbin', '/usr/local/bin', '/usr/sbin', 
                               '/usr/bin', '/sbin', '/bin'],
+        'tokensTemplate': '/tmp/freerds.session.%s',
+    },
+
+    'icp': {
+        'listeningPipe': 'FreeRDS_SessionManager',
+        'mode': 0666,
+    },
+    
+    'thrift': {
+        'certPath': 'server.crt',
+        'keyPath': 'server.key',
+        'listeningIp': '127.0.0.1',
+        'listeningPort': 9091,
+    },
+                  
+    'freerds': {
+        "forceWeakRdpKey": False,
+        "showDebugInfo": False,
+        "disableGraphicsPipeline": False,
+        "disableGraphicsPipelineH264": False,
     },
                   
     'qt': {
@@ -435,11 +56,14 @@ DEFAULT_CONFIG = {
                   
     'weston': {
         'initialGeometry': '1024x768',
+        'serverPath': None,
     },
 
     'x11': {
         'initialGeometry': '1024x768',
         'depth': '24',
+        'serverPath': None,
+        'wmPath': None,
     },
     
     'greeter': {
@@ -455,64 +79,249 @@ DEFAULT_CONFIG = {
     }
 }
 
-
-class SessionManagerConfig(object):
-    def __init__(self):
-        self.global_pipesDirectory = None
-        self.global_listeningPipe = None
-        self.global_ld_library_path = None
-        self.global_pipeTimeout = None
-        self.global_xdg_runtime_schema = None
-        self.global_user_default_path = None
+def updateConfigMap(configInFile, config):
+    for k, v in config.items():
+        if not configInFile.has_key(k): 
+            continue
         
-        self.qt_pluginsPath = None
-        self.qt_variableName = None
-        self.qt_initialGeometry = None
-        
-        self.weston_initialGeometry = None
-
-        self.x11_initialGeometry = None
-        self.x11_depth = None
-        
-        self.greeter_template = None
-        self.greeter_path = None
-        self.greeter_user = None
-
-        self.desktop_template = None
-        self.desktop_path = None
-        self.desktop_user = None
-        
-
-    def loadFromFile(self, fname):
-        ''' load JSON configuration from frm the given filename
-            @param fname: the name of the configuration file 
-        '''        
-        config = json.load(open(fname, "r"))
-        
-        for topK, defaultTopValues in DEFAULT_CONFIG.items():
-            localConfig = config.get(topK, {})
+        if type(v) in [types.IntType, types.TupleType, types.ListType] + list(types.StringTypes):
+            config[k] = configInFile[k]
+        else:
+            v.update(configInFile[k])
                 
-            for k, defaultV in defaultTopValues.items():
-                v = localConfig.get(k, defaultV)            
-                setattr(self, topK + '_' + k, v)        
-            
 
-server = None
+tokenChars = string.ascii_letters + string.digits
+
+logger = logging.getLogger("session")
+
+class FreeRdsSession(object):
+    """
+        @summary: 
+    """
+    
+    def __init__(self, connectionId, user, domain):
+        self.sessionId = 0
+        self.token = ''.join(random.sample(tokenChars, 20))
+        self.tokenFile = None
+        self.connectionId = connectionId
+        self.login = user
+        self.domain = domain
+        self.hostname = None
+        self.authenticated = False
+        self.greeter = None
+        self.desktop = None
+        self.connectTime = time.time()
+        self.logonTime = 0
+        self.disconnectTime = time.time()
+        self.state = wtsapi.WTSInit
+        
+    def getId(self):
+        return self.sessionId
+    
+    def isAuthenticated(self):
+        return self.authenticated
+
+    def close(self):
+        if self.greeter:
+            logger.info("%s: killing greeter process" % self.sessionId)
+            self.greeter.close()
+        
+        if self.desktop:
+            logger.info("%s: killing desktop process" % self.sessionId)
+            self.desktop.close()
+
+
+
+class SessionManagerServer(object):
+    '''
+        @summary: the main ICP server listening for FreeRds connections 
+    '''
+    
+    def __init__(self, config, canImpersonnate):
+        '''
+            @param config: the global configuration 
+        '''
+        self.config = config
+        self.canImpersonnate = canImpersonnate
+        self.sessions = {}
+        self.sessionCounter = 1
+              
+        self.processReaper = content_provider.ContentProviderReaper()
+        self.processReaper.start()
+        self.icpFactory = None
+        self.system_dbus = None
+                        
+    def logonUser(self, connectionId, username, password, domain, hostname):
+        authRes = self.authenticate(username, password, domain)
+        
+        if authRes:
+            for session in self.sessions.values():
+                if session.login != username:
+                    continue
+                if session.domain != domain:
+                    continue
+                if hostname and session.hostname != hostname:
+                    continue
+                
+                session.authenticated = True
+                session.connectionId = connectionId
+                session.state = wtsapi.WTSActive
+                logger.info("logonUser(login=%s, domain=%s): reusing session %d" % (username, domain, session.getId()))
+                return session
+                        
+        session = FreeRdsSession(connectionId, username, domain)
+        self.sessionCounter += 1
+        sid = self.sessionCounter
+        session.sessionId = sid
+        session.state = authRes and wtsapi.WTSActive or wtsapi.WTSConnected
+        session.authenticated = authRes
+        session.tokenFile = self.config['globalConfig']["tokensTemplate"] % session.getId() 
+        self.sessions[sid] = session
+        
+        # write token file for channel authentication
+        open(session.tokenFile, "w").write(session.token)
+        
+        logger.info("logonUser(login=%s, domain=%s): returning session %d" % (username, domain, sid))         
+        return session
+    
+    
+    def authenticate(self, username, password, domain):
+        return self.config['globalConfig']['authMethod'].authenticate(username, domain, password)
+
+    def retrieveSession(self, sessionId):
+        return self.sessions.get(sessionId, None)
+
+    def retrieveSessionByConnectionId(self, connectionId):
+        for s in self.sessions.values():
+            if s.connectionId == connectionId:
+                return s
+            
+        return None
+            
+    def launchByTemplate(self, template, session, appName, appPath, runAs = None):
+        if template == "qt":
+            providerCtor = content_provider.QtContentProvider
+        elif template == "weston":
+            providerCtor = content_provider.WestonContentProvider
+        elif template == "static":
+            providerCtor = content_provider.StaticContentProvider
+        elif template == "x11":
+            providerCtor = content_provider.X11ContentProvider
+        else:
+            logger.error("%s not handled yet, using generic" % template)
+            providerCtor = content_provider.ContentProvider
+        
+        peerCred = self.icpFactory.freeRdsInstance.peerCredentials 
+        provider = providerCtor(appName, appPath, [])
+        if provider.launch(self.config, self.processReaper, session, [], runAs, peerCred) is None:
+            return None
+        return provider           
+        
+        
+    def retrieveGreeter(self, session):
+        greeterConfig = self.config['greeter']
+        if not session.greeter or not session.greeter.isAlive():
+            session.greeter = self.launchByTemplate(greeterConfig['template'], 
+                            session, "greeter", 
+                            greeterConfig['path'], greeterConfig['user']
+            )
+            if not session.greeter:
+                logger.error("retrieveGreeter(): fail to launch a greeter for session %s" % session.getId())
+                return None
+        
+        if not session.greeter.initProvider(self.config):
+            logger.error("retrieveGreeter(): unable to setup the provider for session %s" % session.getId())
+            return None
+              
+        return session.greeter.pipeName
+ 
+            
+    def retrieveDesktop(self, session):
+        desktopConfig = self.config['desktop']
+
+        session = self.sessions.get(session.getId(), None)
+        if not session:
+            logger.error("retrieveDesktop(): session %s not found" % session.getId())
+            
+        if not session.desktop or not session.desktop.isAlive():
+            session.desktop = self.launchByTemplate(desktopConfig['template'], 
+                            session, "desktop", 
+                            desktopConfig['path'], desktopConfig['user']
+            )
+            if not session.desktop:
+                logger.error("retrieveDesktop(): fail to launch a desktop for session %s" % session.getId()) 
+                return None
+
+        if not session.desktop.initProvider(self.config):
+            logger.error("retrieveDesktop(): unable to setup the provider for session %s" % session.getId())
+            return None
+ 
+        return session.desktop.pipeName
+
+    def removeSession(self, session):
+        if session in self.sessions.values():
+            del self.sessions[session.sessionId]
+  
+class SessionNotification(dbus.service.Object):
+    
+    def __init__(self, bus):
+        dbus.service.Object.__init__(self, bus, "/freerds/SessionManager/session/notification")
+        
+    @dbus.service.signal("freerds.SessionManager.session.notification", "uu")
+    def SessionNotification(self, reason, sessionId):
+        pass
 
 if __name__ == "__main__":
+    logging.config.fileConfig("sessionManager.logconfig")
+    canImpersonnate = True
     if os.getuid() != 0:
-        print "WARNING: not running as root, let's hope we won't have to impersonnate"
+        logger.warn("not running as root, let's hope we will not have to impersonnate")
+        canImpersonnate = False
     
-    mainConfig = SessionManagerConfig()
-    mainConfig.loadFromFile(sys.argv[1])
+    # TODO: treat number of arguments
+    mainConfig = DEFAULT_CONFIG.copy()
+    
+    configInFile = {}
+    execfile(sys.argv[1], {}, configInFile)
+    updateConfigMap(configInFile, mainConfig)
+    
+    
+    globalConfig = mainConfig['globalConfig']
+    icpConfig = mainConfig['icp']
+    pipesDir = globalConfig['pipesDirectory']
+    if not os.path.exists(pipesDir):
+        os.makedirs(pipesDir, mode=0777)
+            
+    pipePath = os.path.join(pipesDir, icpConfig['listeningPipe'])
+    if os.path.exists(pipePath):
+        os.remove(pipePath)
 
-    server = SessionManagerServer(mainConfig)
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt, e:
-        server.shutdown()
-        server.socket.close()
-        
-        if server.processReaper:
-            server.processReaper.doStop()
+    core = SessionManagerServer(mainConfig, canImpersonnate)
+    core.icpFactory = IcpFactory(core)
+    thriftFactory = thrift_server.FdsFactory(core)
     
+    icpServer = reactor.listenUNIX(pipePath, core.icpFactory, icpConfig['mode'])
+    
+    thriftConfig = mainConfig['thrift']
+    sslFactory = ssl.DefaultOpenSSLContextFactory(thriftConfig['keyPath'], 
+                                                  thriftConfig['certPath'], 
+                                                  sslmethod=SSL.TLSv1_METHOD
+    )
+    thriftServer = reactor.listenSSL(thriftConfig['listeningPort'], thriftFactory, sslFactory, interface=thriftConfig["listeningIp"])
+    
+    loop = DBusGMainLoop(set_as_default=True)
+    core.system_dbus = dbus.SystemBus(mainloop=loop)
+    err = core.system_dbus.request_name("freerds.SessionManager.session.notification", dbus.bus.NAME_FLAG_REPLACE_EXISTING);
+    if err != dbus.bus.REQUEST_NAME_REPLY_PRIMARY_OWNER:
+        logger.info("unable to acquire the notification name (err=%d)" % err)
+        #sys.exit(1)
+    else:
+        core.sessionNotification = SessionNotification(core.system_dbus)
+    
+    
+    def sigIntCb(signum, sf):
+        print "keyboard interrupt"
+        reactor.stop()
+    signal.signal(signal.SIGINT, sigIntCb)
+    reactor.run()
+
