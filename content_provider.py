@@ -4,8 +4,8 @@ import time
 import pwd
 import stat
 import logging
-from threading import Thread, RLock
-from signal import SIGTERM
+from twisted.internet import protocol, reactor
+
 
 logger = logging.getLogger("contentProvider")
 
@@ -38,46 +38,42 @@ def expandVars(strIn, context):
     return fmt % context
     
 
-class ContentProviderReaper(Thread):
-    '''
-        @summary: a thread that will wait4() child process and notify 
-                content_providers that the underlying process has died
-    '''
+PROCESS_INIT, PROCESS_RUNNING, PROCESS_FINISHED = range(0, 3)
+
+class ContentProviderProcess(protocol.ProcessProtocol):
+    ''' '''
+
     def __init__(self):
-        self.doRun = True
-        self.providers = {}
-        self.providersLock = RLock()
-        super(ContentProviderReaper, self).__init__(name="reaper")            
+        self.state = PROCESS_INIT
+        self.pid = None
     
-    def run(self):
-        while self.doRun:
-            try:
-                (pid, _retCode, _rusage) = os.wait4(0, os.WNOHANG)
-            except:
-                pid = 0
-            
-            if pid:
-                logger.info("ContentProviderReaper: caught pid %s" % pid)
-                self.notifyDeath(pid)
-            
-            time.sleep(0.5)
-            
+    def connectionMade(self):
+        ''' process started '''
+        logger.debug("process %d running" % self.transport.pid)
+        self.state = PROCESS_RUNNING
+        self.pid = self.transport.pid
+
+    def outReceived(self, data):
+        ''' 'process stdout '''
+        #print "%s" % data
+        pass
     
-    def notifyDeath(self, pid):
-        with self.providersLock:
-            provider = self.providers.get(pid, None)            
-            if provider:
-                provider.notifyDeath(pid)
-                del self.providers[pid]
+    def errReceived(self, data):
+        ''' 'process stderr '''
+        #print "%s" % data
+        pass
+
+    def processExited(self, reason):
+        logger.debug("process exited")
         
-            
-    def registerProvider(self, p, pid):
-        with self.providersLock:
-            self.providers[pid] = p
+    def processEnded(self, reason):
+        logger.debug("process stopped")
+        self.state = PROCESS_FINISHED
+
+    def isAlive(self):
+        return self.state == PROCESS_RUNNING
     
-    def doStop(self):
-        self.doRun = False
-            
+
 
 class ContentProvider(object):
     '''
@@ -89,24 +85,13 @@ class ContentProvider(object):
         self.appPath = appPath
         self.env = {}
         self.baseArgs = []
-        self.pid = -1
         self.pipeName = None
         self.pipePath = None
-        self.alive = False
         self.targetUser = None
         self.contextVars = {}
-        self.reaper = None
+        self.mainProcess = None
+
         
-    def isAlive(self):
-        return self.alive
-    
-    def notifyDeath(self, pid):
-        if self.pid != pid:
-            logger.warn("notifyDeath(): strange notified pid is not mine, self.pid=%s pid=%s" % (self.pid, pid))
-            return        
-        self.alive = False
-        self.pid = -1
-    
     def buildEnv(self, globalConfig, context):
         runEnv = {}        
         baseEnv = {                  
@@ -122,7 +107,7 @@ class ContentProvider(object):
             runEnv[k] = expandVars(v, context)
             
         globalConf = globalConfig['globalConfig'] 
-        if globalConf['ld_library_path']:
+        if globalConf.get('ld_library_path', None):
             runEnv['LD_LIBRARY_PATH'] = ":".join(globalConf['ld_library_path'])        
         return runEnv
     
@@ -137,7 +122,7 @@ class ContentProvider(object):
         try:
             xdg_mode = (stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
             if not os.path.exists(xdg_runtime_dir):
-                logger.info("build_xdg_runtime_requirements(): directory %s does not exist" % xdg_runtime_dir)
+                logger.info("build_xdg_runtime_requirements(): runtime directory %s does not exist" % xdg_runtime_dir)
                 os.mkdir(xdg_runtime_dir, xdg_mode)
                 os.system("chown %s %s" % (owner, xdg_runtime_dir))
             else:
@@ -152,48 +137,28 @@ class ContentProvider(object):
             return False
 
      
-    def impersonnateTo(self, globalConfig, targetUser, context, env):
-        currentUser = pwd.getpwuid( os.getuid() ).pw_name
-        
-        try:
-            userInfos = pwd.getpwnam(targetUser)
-        except Exception, e:
-            logger.error("impersonnateTo(): unable to retrieve user %s, e=%s" % (targetUser, e))
-            return False
-                
+    def impersonnateTo(self, globalConfig, pwdInfos, context, env):
         # create the environment
         globalConf = globalConfig['globalConfig']
-        env["HOME"] = userInfos.pw_dir
+        env["HOME"] = pwdInfos.pw_dir
         env["XDG_RUNTIME_DIR"] = expandVars(globalConf['xdg_runtime_schema'], context)
-        env['USER'] = targetUser
-        env['LOGNAME'] = targetUser
-        env['SHELL'] = userInfos.pw_shell
+        env['LOGNAME'] = env['USER'] = pwdInfos.pw_name
+        env['SHELL'] = pwdInfos.pw_shell
         env['PATH'] = ":".join(globalConf['user_default_path'])
         
         # this should be a no-op if no impersonification is needed
-        if not self.build_xdg_runtime_requirements(env["XDG_RUNTIME_DIR"], targetUser):            
-            return False
-
-        if currentUser == targetUser:
-            return True
-
-        #print "targetUser %s: uid=%d gid=%s" % (runAs, targetUser.pw_uid, targetUser.pw_gid)       
-        try:
-            os.setuid(userInfos.pw_uid)
-        except Exception, e:
-            logger.error("impersonnateTo(): unable to setuid(%s), e=%s" % (userInfos.pw_uid, e))
-            return False
-                
-        return True
+        return self.build_xdg_runtime_requirements(env["XDG_RUNTIME_DIR"], pwdInfos.pw_name)
     
-    def launch(self, globalConfig, reaper, session, extraArgs, runAs = None, peerCredentials = None):
+    def launch(self, sm, session, extraArgs, runAs = None, peerCredentials = None):
+        globalConfig = sm.config
         globalConf = globalConfig['globalConfig']
-        if runAs is None:
-            runAs = pwd.getpwuid( os.getuid() ).pw_name
 
         self.pipeName = "FreeRDS_%s_%s" % (session.getId(), self.appName)
         self.pipePath = os.path.join(globalConf['pipesDirectory'], self.pipeName)
         
+        if os.path.exists(self.pipePath):
+            os.remove(self.pipePath)
+
         self.contextVars = {
             "pipeName": self.pipeName,
             "pipePath": self.pipePath,
@@ -206,44 +171,51 @@ class ContentProvider(object):
             self.contextVars["freerds_pid"] = peerCredentials.pid
             self.contextVars["freerds_uid"] = peerCredentials.uid
 
+        currentUid = os.getuid()
+
+        runAsUid = None
+        runAsGid = None
+        if runAs is None:
+            try:
+                runAsUid = currentUid
+                pwdInfos = pwd.getpwuid(runAsUid)
+                runAs = pwdInfos.pw_name
+            except Exception, e:
+                logger.error("launch(): unable to retrieve my login name, e=%s" % e)
+                return False
+        else:
+            try:
+                pwdInfos = pwd.getpwuid(runAs)
+                runAsUid = pwdInfos.pw_uid
+            except Exception, e:
+                logger.error("launch(): unable to retrieve target runAs account %s, e=%s" % (runAs, e))
+                return False
+
+        runAsGid = pwdInfos.pw_gid
+
         self.targetUser = expandVars(runAs, self.contextVars)
         self.contextVars["runAsUser"] = self.targetUser
-        self.contextVars["runAsUserId"] = pwd.getpwnam(self.targetUser).pw_uid
+        self.contextVars["runAsUserId"] = "%s" % runAsUid
+        self.contextVars["runAsGroupId"] = "%s" % runAsGid
 
-        self.reaper = reaper
+        runEnv = self.buildEnv(globalConfig, self.contextVars)
         
-        if os.path.exists(self.pipePath):
-            os.remove(self.pipePath)
-        
-        try:
-            self.pid = os.fork()
-        except Exception, e:            
-            logger.error("launch(): unable to fork(), e=%s" % e)
+        # prepare command line args
+        args = [os.path.basename(self.appPath)]
+        args += self.buildArgs(globalConfig, self.contextVars, extraArgs)
+
+        if not self.impersonnateTo(globalConfig, pwdInfos, self.contextVars, runEnv):
+            logger.error("launch(): unable to impersonnate to %s" % self.targetUser)
             return False
-                        
-        self.alive = True
-        reaper.registerProvider(self, self.pid)
 
-        if self.pid == 0:                             
-            # prepare env variables 
-            runEnv = self.buildEnv(globalConfig, self.contextVars)
+        targetUid = runAsUid
+        targetGid = runAsGid
+        if runAsUid == currentUid:
+            targetUid = None
+            targetGid = None
             
-            if not self.impersonnateTo(globalConfig, self.targetUser, self.contextVars, runEnv):
-                logger.error("launch(): unable to impersonnate to %s" % self.targetUser)
-                sys.exit(1)
-
-            # prepare command line args
-            args = [self.appPath] + self.buildArgs(globalConfig, self.contextVars, extraArgs)                   
-        
-            #print "running %s %s env=%s" % (self.appPath, args, runEnv)
-            try:
-                os.execve(self.appPath, args, runEnv)
-            except Exception, e:
-                logger.error("launch(): error when executing %s %s" % (e, " ".join(args)))
-                sys.exit(1)
-        
-            # /!\ /!\ /!\  /!\ /!\      
-            # we should _never_ reach that point
+        self.mainProcess = reactor.spawnProcess(self, self.appPath, args, runEnv, pwdInfos.pw_dir,
+                            targetUid, targetGid, False)
         
         timeout = globalConf['pipeTimeout']
         while timeout > 0:
@@ -263,15 +235,37 @@ class ContentProvider(object):
         return True
     
     def close(self):
-        if not self.alive:
-            logger.debug("backend still dead")
+        if not self.isAlive():
+            logger.debug("backend already dead")
             return
+
+        try:
+            self.mainProcess.signalProcess("TERM")
+        except Exception, e:
+            logger.error("caught an exception when sending SIGTERM to the content provider, e=%s" % e)
+            return
+
+        def warnNotKilled(provider):
+            # used to print an error message if we didn't manage to receive the death signal in time
+            if provider.isAlive():
+                logger.warn("failed to reap contentProvider with pid %s" % provider.mainProcess.pid) 
+
+        def sigKillIfNeeded(provider):
+            # callback that will send a SIGKILL if SIGTERM was not sufficient
+            if not provider.isAlive():
+                logger.debug("provider killed in time")
+                return
+
+            try:
+                provider.mainProcess.signalProcess("KILL")
+            except Exception, e:
+                logger.error("caught an exception when sending SIGKILL to the content provider, e=%s" % e)
+                return
+            reactor.callLater(1.0, warnNotKilled, provider)
+
+        reactor.callLater(1.0, sigKillIfNeeded, self)
+
         
-        if self.pid > 0:
-            os.kill(self.pid, SIGTERM)
-        
-        while self.alive:
-            time.sleep(0.1)
         
         
 class StaticContentProvider(ContentProvider):
@@ -281,7 +275,9 @@ class StaticContentProvider(ContentProvider):
     '''
     __name__ = 'static'
 
-    def launch(self, globalConfig, reaper, session, extraArgs, runAs, peerCredentials):
+    def launch(self, sm, session, extraArgs, runAs, peerCredentials):
+        globalConfig = sm.config
+
         self.pipeName = self.appPath
         self.pipePath = os.path.join(globalConfig['globalConfig']['pipesDirectory'], self.appPath)
         self.pid = -1
@@ -292,8 +288,12 @@ class StaticContentProvider(ContentProvider):
         ''' it's a no-op for the static content provider '''
         pass
 
+    def isAlive(self):
+        return os.path.exists(self.pipePath)
 
-class QtContentProvider(ContentProvider):
+
+
+class QtContentProvider(ContentProvider, ContentProviderProcess):
     '''
         @summary: 
     '''
@@ -314,7 +314,7 @@ class QtContentProvider(ContentProvider):
         return ret + super(QtContentProvider, self).buildArgs(globalConfig, context, extraArgs)
 
 
-class WestonContentProvider(ContentProvider):
+class WestonContentProvider(ContentProvider, ContentProviderProcess):
     '''
         @summary: 
     '''
@@ -333,7 +333,7 @@ class WestonContentProvider(ContentProvider):
         return ret + super(WestonContentProvider, self).buildArgs(globalConfig, context, extraArgs)
 
 
-class X11ContentProvider(ContentProvider):
+class X11ContentProvider(ContentProvider, ContentProviderProcess):
     '''
         @summary: 
     '''

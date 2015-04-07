@@ -123,11 +123,11 @@ class FreeRdsSession(object):
 
     def close(self):
         if self.greeter:
-            logger.info("%s: killing greeter process" % self.sessionId)
+            logger.info("killing greeter process for session %s" % self.sessionId)
             self.greeter.close()
         
         if self.desktop:
-            logger.info("%s: killing desktop process" % self.sessionId)
+            logger.info("killing desktop process for session %s" % self.sessionId)
             self.desktop.close()
 
 
@@ -145,9 +145,7 @@ class SessionManagerServer(object):
         self.canImpersonnate = canImpersonnate
         self.sessions = {}
         self.sessionCounter = 1
-              
-        self.processReaper = content_provider.ContentProviderReaper()
-        self.processReaper.start()
+
         self.icpFactory = None
         self.system_dbus = None
                         
@@ -213,7 +211,7 @@ class SessionManagerServer(object):
         
         peerCred = self.icpFactory.freeRdsInstance.peerCredentials 
         provider = providerCtor(appName, appPath, [])
-        if provider.launch(self.config, self.processReaper, session, [], runAs, peerCred) is None:
+        if provider.launch(self, session, [], runAs, peerCred) is None:
             return None
         return provider           
         
